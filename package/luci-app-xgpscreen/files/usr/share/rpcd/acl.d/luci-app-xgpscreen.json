@@ -1,0 +1,27 @@
+{
+  "luci-app-xgpscreen": {
+    "description": "Grant access to XGP screen configuration",
+    "read": {
+      "uci": [
+        "xgpscreen"
+      ],
+      "ubus": {
+        "network.interface": [
+          "dump"
+        ],
+        "file": [
+          "exec"
+        ]
+      },
+      "file": {
+        "/usr/bin/xgp-temps": [ "exec" ],
+        "/usr/bin/xgp-temps *": [ "exec" ]
+      }
+    },
+    "write": {
+      "uci": [
+        "xgpscreen"
+      ]
+    }
+  }
+}

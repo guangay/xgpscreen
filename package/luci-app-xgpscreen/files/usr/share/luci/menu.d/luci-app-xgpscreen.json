@@ -1,0 +1,18 @@
+{
+	"admin/services/xgpscreen": {
+		"title": "屏幕设置",
+		"order": 90,
+		"action": { "type": "firstchild" },
+		"depends": { "acl_groups": [ "luci-app-xgpscreen" ], "uci_files": [ "/etc/config/xgpscreen" ] }
+	},
+	"admin/services/xgpscreen/config": {
+		"title": "页面设置",
+		"order": 10,
+		"action": { "type": "view", "path": "xgpscreen" }
+	},
+	"admin/services/xgpscreen/pages": {
+		"title": "页面预览",
+		"order": 15,
+		"action": { "type": "view", "path": "xgppages" }
+	}
+}

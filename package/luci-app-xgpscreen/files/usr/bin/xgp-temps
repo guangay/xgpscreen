@@ -1,0 +1,314 @@
+#!/bin/sh
+# XGP 温度采集器 v2 —— LuCI 状态概览卡片与小屏幕共享，输出单行 JSON。
+# 兼容性设计（不同 SoC / 网卡 / 模组）：
+#   CPU/GPU  thermal_zone type 匹配（soc|cpu / gpu）→ hwmon name 匹配兜底
+#            → thermal_zone0 兜底（仅 CPU）
+#   无线网卡  hwmon name 匹配（mt7*/mt76*/ath*/rtw*/iwl*/brcm*/wifi*；
+#            mt76 家族命名=芯片名_wiphy名，如 mt7915_phy0/mt7615_phy0）
+#            → debugfs 兜底：mt76/temp（新）与 mt76/temperature（mt76x02 老家族，
+#            u8 原生 °C；>200 视为毫度自动除 1000）
+#            注：MT7922 在本固件 mt76(2023-09) 无任何温度接口（hwmon 为
+#            后续版本新增），显示缺失是内核能力边界而非采集缺陷
+#   模组     at-daemon 仲裁（ubus sendat，不直开 AT 口抢读）：
+#            AT+QTEMP（Quectel）→ AT+GTEMP?（Fibocom）→ AT+CPMUTEMP（SIMCom）
+#            带引号键值对（每行一对/同行多对）与裸数字两种响应格式都解析；
+#            端口链 qmodem uci → ttyUSB3 → ttyUSB2（至多 2 个端口）
+# 链路防护（BG68/74 教训）：
+#   1) AT 前查 at-daemon sendat_pending 队列深度，>3 视为忙期直接跳过
+#      （QSCAN/面板操作期间不排队添堵，绝不长时间阻塞屏幕/网页调用方）
+#   2) ubus 单次超时 5s，且一旦 ubus 层超时立即放弃后续端口
+#      （最坏阻塞从 3口×3命令×7s≈63s 收敛到 ≈5s）
+#   3) stale-good：AT 失败/忙期不覆盖旧缓存，120s 内回吐最后一次成功值
+#      （瞬态失败不再把好数据冲成 null）
+#   4) 缓存原子写（.new + mv），屏幕守护与网页轮询并发不撕裂
+# 输出：{"cpu":41,"gpu":39,"wifi":[{"label":"..","temp":59},..],
+#        "modem":{"sensors":[{"label":"..","temp":47},..],"max":47}|null,
+#        "modem_age":15,"ts":epoch}（modem_age=模组数据年龄秒，超 15 为陈旧值）
+# 永不挂死：ubus 自带 -t 超时，无裸 cat 阻塞路径；任何一路失败输出 null/[]。
+
+CACHE=/tmp/state/xgp-temps.cache
+TTL=15
+STALE_TTL=120
+FAIL_TTL=10
+BUSY_PENDING=3
+
+json_label() { printf '%s' "$1" | tr -c 'a-zA-Z0-9._-' '-'; }
+
+# zone_temp <egrep正则>：第一个 type 匹配的 thermal zone 温度（整数°C）
+zone_temp() {
+	local z t
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ -f "$z/type" ] || continue
+		grep -qE "$1" "$z/type" 2>/dev/null || continue
+		t=$(cat "$z/temp" 2>/dev/null) || continue
+		case "$t" in '' | *[!0-9]*) continue ;; esac
+		echo $((t / 1000))
+		return
+	done
+}
+
+# hwmon_line <egrep正则>：所有匹配 hwmon 的温度，每行 "label temp"
+hwmon_line() {
+	local h n tf t idx
+	for h in /sys/class/hwmon/hwmon*; do
+		[ -f "$h/name" ] || continue
+		n=$(cat "$h/name" 2>/dev/null) || continue
+		printf '%s' "$n" | grep -qE "$1" || continue
+		for tf in "$h"/temp*_input; do
+			[ -f "$tf" ] || continue
+			t=$(cat "$tf" 2>/dev/null) || continue
+			case "$t" in '' | *[!0-9]*) continue ;; esac
+			idx=${tf##*/temp}
+			idx=${idx%_input}
+			case "$idx" in 1 | '') idx='' ;; *) idx="-$idx" ;; esac
+			echo "$(json_label "$n")$idx $((t / 1000))"
+		done
+	done
+}
+
+# cpu：thermal zone soc/cpu → hwmon 兜底 → zone0 兜底
+cpu_val() {
+	local v
+	v=$(zone_temp '^(soc|cpu|core|k10|zen|x86)')
+	[ -n "$v" ] && { echo "$v"; return; }
+	v=$(hwmon_line '^(soc|cpu|k10|core|zen)_?temp' | head -1 | cut -d' ' -f2)
+	[ -n "$v" ] && { echo "$v"; return; }
+	v=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null) || return
+	case "$v" in *[!0-9]* | '') return ;; esac
+	echo $((v / 1000))
+}
+
+# gpu：thermal zone → hwmon 兜底
+gpu_val() {
+	local v
+	v=$(zone_temp '^gpu')
+	[ -n "$v" ] && { echo "$v"; return; }
+	hwmon_line '^gpu_?temp' | head -1 | cut -d' ' -f2
+}
+
+# wifi：hwmon 名字匹配 → debugfs temp/temperature 兜底（mt76x02=temperature 原生°C）
+wifi_lines() {
+	local out tf t phy
+	out=$(hwmon_line '^(mt7|mt76|ath|rtw|iwl|brcm|wifi)')
+	[ -n "$out" ] && { echo "$out"; return; }
+	for tf in /sys/kernel/debug/ieee80211/phy*/mt76/temp \
+		/sys/kernel/debug/ieee80211/phy*/mt76/temperature; do
+		[ -f "$tf" ] || continue
+		t=$(cat "$tf" 2>/dev/null) || continue
+		case "$t" in '' | *[!0-9]*) continue ;; esac
+		# 毫度（hwmon 同源）>200 视为毫度；debugfs 原生 u8 °C 直用
+		[ "$t" -gt 200 ] && t=$((t / 1000))
+		phy=${tf#*ieee80211/}
+		echo "mt76-${phy%%/*}" "$t"
+	done
+}
+
+# ---- 模组温度（AT，走 at-daemon 仲裁）----
+
+modem_ports() {
+	local p out n
+	n=0
+	p=$(uci -q get qmodem.6_1.at_port)
+	if [ -n "$p" ] && [ -c "$p" ]; then
+		echo "$p"
+		n=1
+	fi
+	# uci 口之外的兜底至多补 1 个（总量≤2，忙期最坏阻塞收敛）
+	if [ "$n" = "0" ] && [ -c /dev/ttyUSB3 ]; then
+		echo /dev/ttyUSB3
+		n=1
+	fi
+	[ "$n" = "1" ] || [ -c /dev/ttyUSB2 ] || return 0
+	echo /dev/ttyUSB2
+	return 0
+}
+
+# send_at <port> <cmd>：成功输出 response 文本；ubus 层失败输出空且置 _AT_UBUS_FAIL=1
+# 注：jsonfilter 只能用无赋值形式（-e '$.status'），赋值形式输出
+# "export st='success';" 整串，直接比较恒假（真机踩坑）
+send_at() {
+	local tf st rsp
+	tf=$(mktemp /tmp/.xgptemp.XXXXXX) || return
+	if ! ubus -t 5 call at-daemon sendat \
+		"{\"at_port\":\"$1\",\"at_cmd\":\"$2\",\"timeout\":4}" >"$tf" 2>/dev/null; then
+		rm -f "$tf"
+		_AT_UBUS_FAIL=1
+		return
+	fi
+	st=$(jsonfilter -i "$tf" -e '$.status' 2>/dev/null)
+	rsp=$(jsonfilter -i "$tf" -e '$.response' 2>/dev/null \
+		| sed 's/\\r//g; s/\\n/\n/g; s/\\"/"/g')
+	rm -f "$tf"
+	[ "$st" = "success" ] || return
+	printf '%s' "$rsp"
+}
+
+# parse_at_temps <前缀如QTEMP>：stdin=响应文本；输出 "label=temp" 行
+# 兼容：+QTEMP:"a","46" 每行一对（RM520N 实测 15 传感器多行）
+#       +QTEMP: "qfe_wpa_pa0","45","qfe_wpa_pa1","48"（同行多对）
+#       +QTEMP: 45,48 / +GTEMP: 45 / +CPMUTEMP: 45（裸数字）
+# 垃圾值过滤：0（SDR 空槽）与负值（-273 无效）按区间 20..127 丢弃
+parse_at_temps() {
+	local prefix="$1" txt seg pr lbl v max
+	txt=$(cat)
+	case "$txt" in
+	*"OK"*) ;;
+	*) return 1 ;;
+	esac
+	printf '%s' "$txt" | grep -q 'ERROR' && return 1
+	seg=$(printf '%s' "$txt" | tr -d '\r' | grep "+$prefix:")
+	[ -n "$seg" ] || return 1
+	max=0
+	for pr in $(printf '%s' "$seg" \
+		| grep -o '"[^"]*","[0-9]\{1,3\}"' \
+		| sed 's/"\([^"]*\)","\([0-9]*\)"/\1=\2/g'); do
+		case "$pr" in
+		*=*)
+			lbl=${pr%%=*}
+			v=${pr##*=}
+			;;
+		*) continue ;;
+		esac
+		case "$v" in
+		'' | *[!0-9]*) continue ;;
+		esac
+		# 模组壳温合理区间 20..127，区间外丢弃（防误抓前缀编号）
+		[ "$v" -ge 20 ] && [ "$v" -le 127 ] || continue
+		echo "$(json_label "$lbl")=$v"
+		max=1
+	done
+	[ "$max" = "1" ] && return 0
+	# 裸数字格式
+	for v in $(printf '%s' "$seg" | grep -o '\<[0-9]\{1,3\}\>'); do
+		[ "$v" -ge 20 ] && [ "$v" -le 127 ] || continue
+		echo "modem=$v"
+	done
+}
+
+# at_busy：at-daemon 忙判定（队列深度；查询失败不阻塞 AT，返回不忙）
+at_busy() {
+	local tf pend
+	tf=$(mktemp /tmp/.xgptemp.XXXXXX) || return 1
+	ubus -t 3 call at-daemon list >"$tf" 2>/dev/null || { rm -f "$tf"; return 1; }
+	pend=$(jsonfilter -i "$tf" -e '$.sendat_pending' 2>/dev/null)
+	rm -f "$tf"
+	case "$pend" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	[ "$pend" -gt $BUSY_PENDING ]
+}
+
+# cache_read：回显 "ts frag"（无缓存输出空）
+cache_read() {
+	[ -f "$CACHE" ] || return 0
+	sed -n '1p' "$CACHE" | tr -d ' \t'
+	printf ' '
+	sed -n '2p' "$CACHE"
+}
+
+# cache_write <frag>（原子写）
+cache_write() {
+	mkdir -p /tmp/state 2>/dev/null
+	printf '%s\n%s\n' "$(date +%s)" "$1" >"$CACHE.new" 2>/dev/null \
+		&& mv -f "$CACHE.new" "$CACHE" 2>/dev/null
+}
+
+modem_json() {
+	local now cts cfrag port cmd rsp sensors frag lbl v max first tried
+	now=$(date +%s)
+	read -r cts cfrag <<EOF
+$(cache_read | tr '\n' ' ')
+EOF
+	cts=$(printf '%s' "$cts" | tr -d ' ')
+	cfrag=$(printf '%s' "$cfrag" | tr -d ' ')
+	case "$cts" in
+	'' | *[!0-9]*) cts=0 cfrag='' ;;
+	esac
+	# 新鲜好缓存直接命中
+	if [ "$cfrag" != "null" ] && [ -n "$cfrag" ] \
+		&& [ $((now - cts)) -lt $TTL ]; then
+		echo "$cfrag $((now - cts))"
+		return
+	fi
+	# 忙期：不排队添堵；有陈旧好值就回吐（≤120s）
+	if at_busy; then
+		if [ "$cfrag" != "null" ] && [ -n "$cfrag" ] \
+			&& [ $((now - cts)) -lt $STALE_TTL ]; then
+			echo "$cfrag $((now - cts))"
+		else
+			echo "null 0"
+		fi
+		return
+	fi
+	frag=""
+	tried=0
+	for port in $(modem_ports | awk '!seen[$0]++'); do
+		for cmd in 'AT+QTEMP' 'AT+GTEMP?' 'AT+CPMUTEMP'; do
+			rsp=$(send_at "$port" "$cmd")
+			# ubus 层超时=daemon 忙/卡，立即放弃整个 AT 环节
+			if [ "$_AT_UBUS_FAIL" = "1" ]; then
+				_AT_UBUS_FAIL=0
+				break 2
+			fi
+			[ -n "$rsp" ] || continue
+			sensors=$(printf '%s' "$rsp" \
+				| parse_at_temps "$(printf '%s' "$cmd" | sed 's/^AT+//; s/?$//')")
+			[ -n "$sensors" ] || continue
+			frag='{"sensors":['
+			first=1
+			max=0
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				lbl=${line%%=*}
+				v=${line##*=}
+				[ "$v" -gt "$max" ] && max=$v
+				[ "$first" = "1" ] || frag="$frag,"
+				first=0
+				frag="$frag{\"label\":\"$lbl\",\"temp\":$v}"
+			done <<EOF
+$sensors
+EOF
+			frag="$frag],\"max\":$max}"
+			break 2
+		done
+		tried=$((tried + 1))
+		[ "$tried" -ge 2 ] && break
+	done
+	if [ -n "$frag" ]; then
+		cache_write "$frag"
+		echo "$frag 0"
+	elif [ "$cfrag" != "null" ] && [ -n "$cfrag" ] \
+		&& [ $((now - cts)) -lt $STALE_TTL ]; then
+		# 失败不覆盖好缓存：回吐陈旧好值
+		echo "$cfrag $((now - cts))"
+	else
+		# 无好值可退才写 fail 标记（FAIL_TTL 节流重试）
+		cache_write "null"
+		echo "null 0"
+	fi
+}
+
+# ---- 汇总输出 ----
+
+v=$(cpu_val)
+cpu=${v:-null}
+v=$(gpu_val)
+gpu=${v:-null}
+
+wifi="["
+first=1
+while IFS=' 	' read -r lbl t; do
+	[ -n "$lbl" ] && [ -n "$t" ] || continue
+	[ "$first" = "1" ] || wifi="$wifi,"
+	first=0
+	wifi="$wifi{\"label\":\"$lbl\",\"temp\":$t}"
+done <<EOF
+$(wifi_lines)
+EOF
+wifi="$wifi]"
+
+set -- $(modem_json)
+modem=${1:-null}
+mage=${2:-0}
+
+echo "{\"cpu\":$cpu,\"gpu\":$gpu,\"wifi\":$wifi,\"modem\":$modem,\"modem_age\":$mage,\"ts\":$(date +%s)}"

@@ -1,0 +1,42 @@
+#!/bin/sh /etc/rc.common
+# XGP V3 自定义屏幕渲染服务（fb0 唯一持有者）
+
+START=98
+STOP=10
+USE_PROCD=1
+PROG=/usr/bin/xgpscreen.py
+
+unbind_fbcon() {
+	# console=tty0 的内核控制台占据屏幕顶部行，解绑让渲染器独占 fb0
+	for v in /sys/class/vtconsole/vtcon*; do
+		grep -q "frame buffer device" "$v/name" 2>/dev/null && echo 0 > "$v/bind"
+	done
+}
+
+start_service() {
+	local enabled
+	config_load xgpscreen
+	config_get enabled main enabled 1
+	[ "$enabled" = "1" ] || return 0
+
+	unbind_fbcon
+
+	procd_open_instance
+	procd_set_param command "$PROG"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	# 重新绑定内核控制台（恢复开机日志上屏能力）
+	for v in /sys/class/vtconsole/vtcon*; do
+		grep -q "frame buffer device" "$v/name" 2>/dev/null && echo 1 > "$v/bind"
+	done
+}
+
+reload_service() {
+	stop
+	start
+}

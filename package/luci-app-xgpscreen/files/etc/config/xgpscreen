@@ -1,5 +1,5 @@
 config main 'main'
-	option enabled '1'
+	option enabled '0'
 	option rotate '0'
 	option invert '0'
 	option interval '5'
